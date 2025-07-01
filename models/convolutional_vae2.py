@@ -1,20 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-convolutional_vae.py
+convolutional_vae2.py (v2.0 con GroupNorm)
 
-Standalone implementation of the ConvolutionalVAE used by the
-`sat_night.py` Alzheimer‑classification pipeline.
-
-Separating the network definition from the training/evaluation script makes
-it easier to reuse the model across experiments, unit‑test it in isolation,
-and keep `sat_night.py` focused on data orchestration and experiment logic.
-
-Usage (inside sat_night.py or any other module):
-    from models.convolutional_vae import ConvolutionalVAE
-
+Implementación del VAE Convolucional.
+Cambios:
+- Reemplazado BatchNorm2d por GroupNorm para mayor estabilidad con
+  diferentes tamaños de batch.
+- Añadido el hiperparámetro 'num_groups' para controlar GroupNorm.
 """
-
 from typing import Tuple, Union, List
 import torch
 import torch.nn as nn
@@ -23,7 +17,7 @@ __all__ = ["ConvolutionalVAE"]
 
 
 class ConvolutionalVAE(nn.Module):
-    """CNN‑based Variational Autoencoder for fMRI connectivity tensors."""
+    """CNN‑based Variational Autoencoder con GroupNorm."""
 
     def __init__(
         self,
@@ -36,9 +30,11 @@ class ConvolutionalVAE(nn.Module):
         use_layernorm_fc: bool = False,
         num_conv_layers_encoder: int = 4,
         decoder_type: str = "convtranspose",
+        num_groups: int = 8,  # ⬅️ NUEVO: Hiperparámetro para GroupNorm
     ) -> None:
         super().__init__()
 
+        # Validaciones y asignaciones de parámetros
         if num_conv_layers_encoder not in {3, 4}:
             raise ValueError("num_conv_layers_encoder must be 3 or 4.")
         if decoder_type not in {"upsample_conv", "convtranspose"}:
@@ -52,9 +48,10 @@ class ConvolutionalVAE(nn.Module):
         self.use_layernorm_fc = use_layernorm_fc
         self.num_conv_layers_encoder = num_conv_layers_encoder
         self.decoder_type = decoder_type
+        self.num_groups = num_groups  # ⬅️ NUEVO
 
         # ------------------------------
-        # Encoder (conv → optional FC)  
+        # Encoder (conv → optional FC)
         # ------------------------------
         encoder_layers: List[nn.Module] = []
         curr_ch = input_channels
@@ -70,8 +67,9 @@ class ConvolutionalVAE(nn.Module):
         for k, p, s, ch_out in zip(kernels, paddings, strides, conv_ch_enc):
             encoder_layers += [
                 nn.Conv2d(curr_ch, ch_out, kernel_size=k, stride=s, padding=p),
-                nn.ReLU(),
-                nn.BatchNorm2d(ch_out),
+                nn.GELU(),
+                # --- CAMBIO PRINCIPAL ---
+                nn.GroupNorm(self.num_groups, ch_out), # ⬅️ CAMBIADO de BatchNorm2d
                 nn.Dropout2d(p=dropout_rate),
             ]
             curr_ch = ch_out
@@ -83,13 +81,13 @@ class ConvolutionalVAE(nn.Module):
         self.final_spatial_dim = dim
         flat_size = curr_ch * dim * dim
 
-        # Optional FC compressor before μ, logσ²
+        # Capas FC del codificador (sin cambios, LayerNorm es mejor aquí)
         self.intermediate_fc_dim = self._resolve_intermediate_fc(intermediate_fc_dim_config, flat_size)
         if self.intermediate_fc_dim:
             fc_layers = [nn.Linear(flat_size, self.intermediate_fc_dim)]
             if use_layernorm_fc:
                 fc_layers.append(nn.LayerNorm(self.intermediate_fc_dim))
-            fc_layers += [nn.ReLU(), nn.BatchNorm1d(self.intermediate_fc_dim), nn.Dropout(p=dropout_rate)]
+            fc_layers += [nn.GELU(), nn.BatchNorm1d(self.intermediate_fc_dim), nn.Dropout(p=dropout_rate)]
             self.encoder_fc_intermediate = nn.Sequential(*fc_layers)
             mu_logvar_in = self.intermediate_fc_dim
         else:
@@ -106,7 +104,7 @@ class ConvolutionalVAE(nn.Module):
             dec_fc_layers = [nn.Linear(latent_dim, self.intermediate_fc_dim)]
             if use_layernorm_fc:
                 dec_fc_layers.append(nn.LayerNorm(self.intermediate_fc_dim))
-            dec_fc_layers += [nn.ReLU(), nn.BatchNorm1d(self.intermediate_fc_dim), nn.Dropout(p=dropout_rate)]
+            dec_fc_layers += [nn.GELU(), nn.BatchNorm1d(self.intermediate_fc_dim), nn.Dropout(p=dropout_rate)]
             self.decoder_fc_intermediate = nn.Sequential(*dec_fc_layers)
             dec_fc_out = self.intermediate_fc_dim
         else:
@@ -123,7 +121,6 @@ class ConvolutionalVAE(nn.Module):
             decoder_paddings = paddings[::-1]
             decoder_strides = strides[::-1]
 
-            # Compute output_padding dynamically so that shapes match exactly.
             output_paddings: List[int] = []
             tmp_dim = self.final_spatial_dim
             for i in range(num_conv_layers_encoder):
@@ -144,10 +141,14 @@ class ConvolutionalVAE(nn.Module):
                         padding=decoder_paddings[i],
                         output_padding=output_paddings[i],
                     ),
-                    nn.ReLU() if i < len(target_conv_t_channels) - 1 else nn.Identity(),
+                    nn.GELU() if i < len(target_conv_t_channels) - 1 else nn.Identity(),
                 ]
                 if i < len(target_conv_t_channels) - 1:
-                    decoder_layers += [nn.BatchNorm2d(ch_out), nn.Dropout2d(p=dropout_rate)]
+                    # --- CAMBIO PRINCIPAL ---
+                    decoder_layers += [
+                        nn.GroupNorm(self.num_groups, ch_out), # ⬅️ CAMBIADO de BatchNorm2d
+                        nn.Dropout2d(p=dropout_rate)
+                    ]
                 curr_ch_dec = ch_out
         else:
             raise NotImplementedError("'upsample_conv' decoder not implemented yet.")
@@ -159,22 +160,15 @@ class ConvolutionalVAE(nn.Module):
 
         self.decoder_conv = nn.Sequential(*decoder_layers)
 
-    # ------------------------------------------------------------------
-    # Forward helpers
-    # ------------------------------------------------------------------
+    # Resto de la clase (forward, encode, decode, etc.) no necesita cambios
     def _resolve_intermediate_fc(self, cfg: Union[int, str], flat_size: int) -> int:
-        if cfg == "0" or cfg == 0:
-            return 0
+        if cfg == "0" or cfg == 0: return 0
         if isinstance(cfg, str):
             cfg = cfg.lower()
-            if cfg == "half":
-                return flat_size // 2
-            if cfg == "quarter":
-                return flat_size // 4
-            try:
-                return int(cfg)
-            except ValueError:
-                return 0
+            if cfg == "half": return flat_size // 2
+            if cfg == "quarter": return flat_size // 4
+            try: return int(cfg)
+            except ValueError: return 0
         return int(cfg)
 
     def encode(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -192,22 +186,13 @@ class ConvolutionalVAE(nn.Module):
     def decode(self, z: torch.Tensor) -> torch.Tensor:
         h = self.decoder_fc_intermediate(z)
         h = self.decoder_fc_to_conv(h)
-        h = h.view(
-            h.size(0),
-            self.final_conv_ch,
-            self.final_spatial_dim,
-            self.final_spatial_dim,
-        )
+        h = h.view(h.size(0), self.final_conv_ch, self.final_spatial_dim, self.final_spatial_dim)
         return self.decoder_conv(h)
 
-    def forward(
-        self, x: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         mu, logvar = self.encode(x)
         z = self.reparameterize(mu, logvar)
         recon_x = self.decode(z)
         if recon_x.shape != x.shape:
-            recon_x = nn.functional.interpolate(
-                recon_x, size=(x.shape[2], x.shape[3]), mode="bilinear", align_corners=False
-            )
+            recon_x = nn.functional.interpolate(recon_x, size=(x.shape[2], x.shape[3]), mode="bilinear", align_corners=False)
         return recon_x, mu, logvar, z

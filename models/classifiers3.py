@@ -116,7 +116,7 @@ def get_classifier_and_grid(
         model = LogisticRegression(random_state=seed, class_weight=class_weight, solver='liblinear', max_iter=2000)
         param_distributions = {
             # El rango actual es bueno, no necesita cambios drásticos
-            'model__C': FloatDistribution(1e-4, 1e3, log=True)
+            'model__C': FloatDistribution(1e-5, 1e3, log=True)
         }
         n_iter_search = 120
 
@@ -185,14 +185,14 @@ def get_classifier_and_grid(
 
         param_distributions = {
             "model__n_estimators": IntDistribution(200, 1500), # Rango ajustado
-            "model__learning_rate": FloatDistribution(1e-3, 0.2, log=True),
-            "model__max_depth": IntDistribution(3, 10),
-            "model__subsample": FloatDistribution(0.5, 1.0),
-            "model__colsample_bytree": FloatDistribution(0.5, 1.0),
+            "model__learning_rate": FloatDistribution(1e-5, 0.1, log=True),
+            "model__max_depth": IntDistribution(3, 12),
+            "model__subsample": FloatDistribution(0.3, 1.1),
+            "model__colsample_bytree": FloatDistribution(0.1, 1.2),
             # min_child_weight es un parámetro de regularización importante
-            "model__min_child_weight": FloatDistribution(1, 20, log=True),
+            "model__min_child_weight": FloatDistribution(0.5, 20, log=True),
         }
-        n_iter_search = 100
+        n_iter_search = 150
 
     elif ctype == "cat":
         model = CatBoostClassifier(random_state=seed, eval_metric="Logloss", verbose=0, loss_function="Logloss", thread_count=1)
